@@ -1,147 +1,173 @@
-use futures::{SinkExt, StreamExt};
-use std::env;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     select,
-    sync::broadcast,
 };
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message, WebSocketStream};
 
-async fn tunnel_server() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:9050").await?;
-    println!("Tunnel server listening on port 9050");
+async fn handle_server_connection(mut client_stream: TcpStream) {
+    let mut target = match TcpStream::connect("127.0.0.1:5435").await {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("Failed to connect to target: {}", e);
+            return;
+        }
+    };
 
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(async move {
-            let ws_stream = accept_async(stream).await.expect("Failed to accept");
-            let postgres = TcpStream::connect("127.0.0.1:5433")
-                .await
-                .expect("Failed to connect to postgres");
-            handle_tunnel(ws_stream, postgres).await;
-        });
-    }
-    Ok(())
-}
+    println!("Connected to target on port 5435");
 
-async fn tunnel_client() -> Result<(), Box<dyn std::error::Error>> {
-    let ws_stream = connect_async("ws://127.0.0.1:9050").await?.0;
-    let (mut ws_write, mut ws_read) = ws_stream.split();
-    let (tx, _rx) = broadcast::channel::<Vec<u8>>(32);
-    let local_listener = TcpListener::bind("127.0.0.1:5439").await?;
-    println!("Client listening on port 5439");
-
-    while let Ok((local_stream, _)) = local_listener.accept().await {
-        let tx = tx.clone();
-        let mut rx = tx.subscribe();
-        tokio::spawn(async move {
-            handle_local_connection(local_stream, tx, rx).await;
-        });
-    }
-    Ok(())
-}
-
-async fn handle_local_connection(
-    mut local_stream: TcpStream,
-    tx: broadcast::Sender<Vec<u8>>,
-    mut rx: broadcast::Receiver<Vec<u8>>,
-) {
-    let mut buf = vec![0u8; 8192];
+    let mut client_buf = vec![0u8; 8192];
+    let mut target_buf = vec![0u8; 8192];
     let mut bytes_sent = 0;
     let mut bytes_received = 0;
 
     loop {
         select! {
-            n = local_stream.read(&mut buf) => {
-                match n {
-                    Ok(n) if n == 0 => break, // Connection closed
+            result = client_stream.read(&mut client_buf) => {
+                match result {
+                    Ok(0) => {
+                        println!("Client closed connection");
+                        break;
+                    }
                     Ok(n) => {
                         bytes_sent += n;
-                        println!("Sent {} bytes (total: {})", n, bytes_sent);
-                        if let Err(e) = tx.send(buf[..n].to_vec()) {
-                            eprintln!("Failed to send to broadcast: {}", e);
+                        println!("Forwarding {} bytes to target (total sent: {})", n, bytes_sent);
+                        if let Err(e) = target.write_all(&client_buf[..n]).await {
+                            eprintln!("Failed to write to target: {}", e);
                             break;
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to read from local stream: {}", e);
+                        eprintln!("Failed to read from client: {}", e);
                         break;
                     }
                 }
             }
-            msg = rx.recv() => {
-                match msg {
-                    Ok(data) => {
-                        bytes_received += data.len();
-                        println!("Received {} bytes (total: {})", data.len(), bytes_received);
-                        if let Err(e) = local_stream.write_all(&data).await {
-                            eprintln!("Failed to write to local stream: {}", e);
+            result = target.read(&mut target_buf) => {
+                match result {
+                    Ok(0) => {
+                        println!("Target closed connection");
+                        break;
+                    }
+                    Ok(n) => {
+                        bytes_received += n;
+                        println!("Forwarding {} bytes to client (total received: {})", n, bytes_received);
+                        if let Err(e) = client_stream.write_all(&target_buf[..n]).await {
+                            eprintln!("Failed to write to client: {}", e);
                             break;
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to receive from broadcast: {}", e);
+                        eprintln!("Failed to read from target: {}", e);
                         break;
                     }
                 }
             }
         }
     }
-    println!("Connection closed. Total bytes: sent={}, received={}", bytes_sent, bytes_received);
+
+    println!(
+        "Connection closed. Total bytes: sent={}, received={}",
+        bytes_sent, bytes_received
+    );
 }
 
-async fn handle_tunnel(ws_stream: WebSocketStream<TcpStream>, mut postgres: TcpStream) {
-    let (mut ws_write, mut ws_read) = ws_stream.split();
-    let mut buf = vec![0u8; 8192];
+async fn handle_client_connection(mut server_stream: TcpStream) {
+    let mut target = match TcpStream::connect("127.0.0.1:9051").await {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("Failed to connect to server: {}", e);
+            return;
+        }
+    };
+
+    println!("Connected to server on port 9051");
+
+    let mut client_buf = vec![0u8; 8192];
+    let mut server_buf = vec![0u8; 8192];
+    let mut bytes_sent = 0;
+    let mut bytes_received = 0;
 
     loop {
         select! {
-            n = postgres.read(&mut buf) => {
-                match n {
-                    Ok(n) if n == 0 => break, // Connection closed
+            result = server_stream.read(&mut client_buf) => {
+                match result {
+                    Ok(0) => {
+                        println!("Client closed connection");
+                        break;
+                    }
                     Ok(n) => {
-                        println!("Writing {} bytes to websocket", n);
-                        if let Err(e) = ws_write.send(Message::Binary(buf[..n].to_vec())).await {
-                            eprintln!("Failed to send to websocket: {}", e);
+                        bytes_sent += n;
+                        println!("Forwarding {} bytes to server (total sent: {})", n, bytes_sent);
+                        if let Err(e) = target.write_all(&client_buf[..n]).await {
+                            eprintln!("Failed to write to server: {}", e);
                             break;
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to read from postgres: {}", e);
+                        eprintln!("Failed to read from client: {}", e);
                         break;
                     }
                 }
             }
-            msg = ws_read.next() => {
-                match msg {
-                    Some(Ok(Message::Binary(data))) => {
-                        println!("Received {} bytes", data.len());
-                        if let Err(e) = postgres.write_all(&data).await {
-                            eprintln!("Failed to write to postgres: {}", e);
+            result = target.read(&mut server_buf) => {
+                match result {
+                    Ok(0) => {
+                        println!("Server closed connection");
+                        break;
+                    }
+                    Ok(n) => {
+                        bytes_received += n;
+                        println!("Forwarding {} bytes to client (total received: {})", n, bytes_received);
+                        if let Err(e) = server_stream.write_all(&server_buf[..n]).await {
+                            eprintln!("Failed to write to client: {}", e);
                             break;
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(e)) => {
-                        eprintln!("WebSocket error: {}", e);
+                    Err(e) => {
+                        eprintln!("Failed to read from server: {}", e);
                         break;
                     }
-                    _ => {} // Ignore other message types
                 }
             }
         }
     }
+
+    println!(
+        "Connection closed. Total bytes: sent={}, received={}",
+        bytes_sent, bytes_received
+    );
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("server") => tunnel_server().await?,
-        Some("client") => tunnel_client().await?,
-        _ => println!("Usage: program [server|client]"),
+        Some("server") => {
+            let listener = TcpListener::bind("127.0.0.1:9051").await?;
+            println!("Server listening on port 9051, forwarding to port 5435");
+
+            while let Ok((stream, addr)) = listener.accept().await {
+                println!("New server connection from {}", addr);
+                tokio::spawn(async move {
+                    handle_server_connection(stream).await;
+                });
+            }
+        }
+        Some("client") => {
+            let listener = TcpListener::bind("127.0.0.1:5439").await?;
+            println!("Client listening on port 5439, forwarding to server on port 9051");
+
+            while let Ok((stream, addr)) = listener.accept().await {
+                println!("New client connection from {}", addr);
+                tokio::spawn(async move {
+                    handle_client_connection(stream).await;
+                });
+            }
+        }
+        _ => {
+            println!("Usage: program [server|client]");
+        }
     }
+
     Ok(())
 }
